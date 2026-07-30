@@ -19,6 +19,7 @@ from plotly.subplots import make_subplots
 
 import carbon as CB
 import model as M
+import renovation as REN
 import scene3d
 import simulate as S
 
@@ -228,6 +229,40 @@ with st.sidebar:
                       format="%.2f")
         q_occ = num("internal gains when present", 250.0, "W", step=50.0)
         q_abs = num("internal gains when away", 10.0, "W", step=5.0)
+    with st.expander("🔨 Renovation of the envelope"):
+        st.caption("Each measure only lowers a U-value or the air change rate — "
+                   "heating demand, cost and CO₂ then follow from the same "
+                   "simulation. Nothing selected = the house as built.")
+        pkg = st.selectbox("start from a package", ["(custom)"] + list(REN.PACKAGES))
+        if pkg != "(custom)" and st.session_state.get("_pkg") != pkg:
+            st.session_state["_pkg"] = pkg          # apply once, then stay editable
+            st.session_state["ren_sel"] = list(REN.PACKAGES[pkg])
+            st.rerun()
+        ren_sel, ren_dropped = REN.resolve(
+            st.multiselect("measures", list(REN.MEASURES), key="ren_sel"))
+        for d in ren_dropped:
+            st.caption(f"↳ *{REN.MEASURES[d]['tag']}* is superseded by the better "
+                       "measure on the same element — not applied, not paid for.")
+        sub_on = st.checkbox("apply the Programme Bâtiments subsidy", value=True,
+                             help="Flat rate per m² for insulating an opaque "
+                                  "element against outside air or an unheated "
+                                  "space. Windows alone, air sealing and "
+                                  "ventilation do not qualify.")
+        sub_chf = num("insulation subsidy", REN.INSULATION_SUBSIDY, "CHF/m²",
+                      step=10.0, disabled=not sub_on) if sub_on else 0.0
+        ren_areas = REN.element_areas(aw + a_s)
+        ren_items = REN.measure_items(ren_sel, ren_areas, sub_chf if sub_on else 0.0)
+        if ren_items:
+            st.caption("**Cost and embodied CO₂ of each measure** (defaults for a "
+                       "small alpine building — edit freely):")
+        for it in ren_items:
+            it["chf"] = num(f"cost — {it['tag']}", it["chf"], "CHF", step=500.0,
+                            key=f"in_ren_chf_{it['tag']}", min_value=0.0)
+            it["kg"] = num(f"embodied — {it['tag']}", it["kg"], "kg CO₂eq", step=50.0,
+                           key=f"in_ren_kg_{it['tag']}", min_value=0.0)
+            it["life"] = num(f"lifetime — {it['tag']}", it["life"], "years", step=5.0,
+                             key=f"in_ren_life_{it['tag']}", min_value=1.0)
+            it["subsidy"] = min(it["subsidy"], it["chf"])
     with st.expander("Heating systems"):
         pel_el_run = num("pellet stove electronics while burning", M.PELLET_EL_RUN, "W",
                          step=10.0)
@@ -311,11 +346,20 @@ with st.sidebar:
 
 # ------------------------------------------------------------------ derived quantities
 a_win = aw + a_s
-a_wall = (2 * (M.LEN_NS + M.LEN_EW) * M.EAVES_H
-          + 2 * 0.5 * M.LEN_NS * (M.RIDGE_H - M.EAVES_H) - a_win)
-h_trans = a_wall * u_wall + M.A_ROOF * u_roof + a_win * u_win + M.A_FLOOR * u_floor * M.B_FLOOR
-h_tot = h_trans + ach * M.VOLUME * 0.34
-c_eff = c_eff_kwh * 3.6e6
+a_wall = ren_areas["wall"]
+
+# The renovation acts here and nowhere else: it hands a modified fabric to the
+# same conductance calculation, so every number downstream — indoor temperature,
+# heating demand, running cost, CO₂ — follows on its own.
+fabric_base = REN.base_fabric(u_wall, u_roof, u_win, u_floor, ach)
+fabric = REN.fabric_after(ren_sel, fabric_base)
+cond_base = REN.conductances(fabric_base, ren_areas)
+cond = REN.conductances(fabric, ren_areas)
+h_base, h_tot = sum(cond_base.values()), sum(cond.values())
+c_base = c_eff_kwh * 3.6e6
+c_eff = c_base * fabric["c_mult"]
+ren_aux_w = REN.aux_watts(ren_items)                    # MVHR fans, permanent load
+ren_gross, ren_sub, ren_net, ren_capex_yr = REN.capex(ren_items)
 kwp_pan = mod_n * mod_wp / 1000.0
 kwp_pv = {"none": 0.0, "half roof (south pan)": kwp_pan,
           "full roof (both pans)": 2 * kwp_pan}[pv_option]
@@ -336,20 +380,27 @@ SCEN_DEFS = {   # setpoint_abs, capacity (None = unlimited)
 
 OFFGRID_MODE = {"B": "direct", "C2": "direct_away", "E": "hp", "P": "pellet"}
 
-def scenario_at(name, yr):
+# A "variant" is the house the physics sees: (H, permanent extra load, thermal mass).
+# RENOVATED is what the sidebar describes; AS_BUILT is the same house without the
+# measures, and is what every saving on this page is measured against.
+RENOVATED = (h_tot, ren_aux_w, c_eff)
+AS_BUILT = (h_base, 0.0, c_base)
+
+def scenario_at(name, yr, var=None):
     """(tin, q_heat, offgrid-series-or-None) for a scenario at climate year `yr`."""
     sp_abs, cap = SCEN_DEFS[name]
     key = name.split(" ")[0]
+    h, ax, c = var or RENOVATED
     if offgrid:
         return run_sim_offgrid(yr, occ_spec, sp_occ, sp_abs, cap,
-                               OFFGRID_MODE.get(key, "none"), preheat, h_tot, c_eff,
+                               OFFGRID_MODE.get(key, "none"), preheat, h, c,
                                aw, a_s, g_win, win_eff, q_occ, q_abs,
                                kwp_pv, kwp_pan, pv_pr, batt_kwh, batt_kw, batt_eff,
-                               dhw_kwh, base_occ, base_abs,
+                               dhw_kwh, base_occ + ax, base_abs + ax,
                                cap_hp, cop0, cop_slope, cop_min, cop_max,
                                pel_el_run, pel_el_ign, pel_ign_min / 60.0)
     tin, qh = run_sim(yr, occ_spec, sp_occ, sp_abs, cap, preheat,
-                      h_tot, c_eff, aw, a_s, g_win, win_eff, q_occ, q_abs)
+                      h, c, aw, a_s, g_win, win_eff, q_occ, q_abs)
     return tin, qh, None
 
 def scenario_full(name):
@@ -366,10 +417,14 @@ st.caption(f"Zinal, Val d'Anniviers (VS), ~1680 m · climate of **{year}** "
            "x-axis shows a template year, times in UTC"
            + (" · **⚡ OFF-GRID: PV + battery only**" if offgrid else ""))
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("heat-loss coefficient", f"{h_tot:.0f} W/K")
+k1.metric("heat-loss coefficient", f"{h_tot:.0f} W/K",
+          delta=f"{h_tot - h_base:.0f} vs as built" if ren_sel else None,
+          delta_color="inverse")
 k2.metric("time constant", f"{c_eff / h_tot / 3600:.0f} h")
 k3.metric("days occupied", f"{occ_days}")
-k4.metric("roof surface", f"{M.A_ROOF:.0f} m²")
+k4.metric("renovation" if ren_sel else "roof surface",
+          f"{ren_net:,.0f} CHF" if ren_sel else f"{M.A_ROOF:.0f} m²",
+          delta=f"{len(ren_sel)} measures" if ren_sel else None, delta_color="off")
 k5.metric("PV selected", f"{kwp_pv:.1f} kWp")
 
 with st.expander("🏠 House, terrain & sun paths (3D — drag to rotate)", expanded=True):
@@ -435,9 +490,11 @@ st.caption("Click a legend entry to hide a series together with its bands.")
 dhw_e = dhw_kwh * occ_days                              # kWh/yr electric DHW
 dhw_w = np.zeros(8760)
 dhw_w[occ & (tmy()["hour"] >= 11) & (tmy()["hour"] < 17)] = dhw_kwh * 1000.0 / 6.0
-base_w = np.where(occ, base_occ, base_abs)              # plugs: present vs standby
 kwh = lambda q: float(np.sum(q)) / 1000.0
-base_kwh = kwh(base_w)
+base_w = np.where(occ, base_occ, base_abs) + ren_aux_w  # plugs + any MVHR fans
+plug_kwh = kwh(np.where(occ, base_occ, base_abs))       # plugs alone
+ren_aux_kwh = ren_aux_w * 8760 / 1000.0                 # fans, running all year
+base_kwh = plug_kwh + ren_aux_kwh
 
 def hp_electric(need, ww=None):
     """Hourly heat-pump electricity (W) incl. resistance backup above capacity."""
@@ -447,42 +504,48 @@ def hp_electric(need, ww=None):
     cop = np.clip(cop0 + cop_slope * t2m, cop_min, cop_max)
     return q_hp / cop + (need - q_hp)
 
-def fuel_and_power(name, yr):
-    """(electricity kWh, pellets kg, wood steres) bought in one year at climate `yr`."""
-    _, q_heat, ser = scenario_at(name, yr)
+def fuel_and_power(name, yr, var=None):
+    """(electricity kWh, pellets kg, wood steres) used in one year at climate `yr`."""
+    _, q_heat, ser = scenario_at(name, yr, var)
     key = name.split(" ")[0]
-    if offgrid:                       # nothing is bought from a grid that isn't there
-        e = 0.0
-    elif key == "A":
-        e = dhw_e + base_kwh
-    elif key == "B":
-        e = kwh(q_heat) + dhw_e + base_kwh
+    fixed = dhw_e + plug_kwh + (var or RENOVATED)[1] * 8.76   # DHW + plugs + fans
+    if key == "B":
+        e = kwh(q_heat) + fixed
     elif key == "C2":
-        e = kwh(q_heat[~occ]) + dhw_e + base_kwh
-    elif key == "C":
-        e = dhw_e + base_kwh
+        e = kwh(q_heat[~occ]) + fixed
     elif key == "P":
-        e = kwh(pellet_aux(q_heat)) + dhw_e + base_kwh
-    else:                             # E, heat pump
-        e = kwh(hp_electric(q_heat, weather(yr))) + dhw_e + base_kwh
+        e = kwh(pellet_aux(q_heat)) + fixed
+    elif key == "E":
+        e = kwh(hp_electric(q_heat, weather(yr))) + fixed
+    else:                             # A (no heating) and C (wood only)
+        e = fixed
     kg = kwh(q_heat) / (pel_eff * pel_kwh) if key == "P" else 0.0
     st_ = (kwh(q_heat[occ]) if key == "C2" else kwh(q_heat)) / (stove_eff * kwh_stere) \
         if key.startswith("C") else 0.0
     return e, kg, st_
 
-def operational_parts(name, yr):
+def bought(e):
+    """Electricity actually paid for — off-grid, it is made on site, not bought."""
+    return 0.0 if offgrid else e
+
+def running_cost(name, yr, var=None):
+    """CHF/yr of bought energy for a scenario at climate `yr`."""
+    e, kg, st_ = fuel_and_power(name, yr, var)
+    return bought(e) * p_elec + kg * p_pel + st_ * p_stere
+
+def operational_parts(name, yr, var=None):
     """kg CO₂eq for one year at climate `yr`, split by source."""
-    e, kg, st_ = fuel_and_power(name, yr)
+    e, kg, st_ = fuel_and_power(name, yr, var)
     fuel_pel, fuel_log = kg * pel_kwh, st_ * kwh_stere      # kWh of fuel burnt
-    return {"grid electricity": e * co2_elec / 1000.0,
+    return {"grid electricity": bought(e) * co2_elec / 1000.0,
             "pellets (supply chain)": fuel_pel * co2_pel / 1000.0,
             "firewood (supply chain)": fuel_log * co2_log / 1000.0,
             "wood CO₂ not regrown": (fuel_pel + fuel_log) * co2_bio
                                     * (bio_pct / 100.0) / 1000.0}
 
-def operational_co2(name, yr):
+def operational_co2(name, yr, var=None):
     """kg CO₂eq bought-energy emissions for one year at climate `yr`."""
-    return sum(operational_parts(name, yr).values())
+    return sum(operational_parts(name, yr, var).values())
 
 def pellet_aux(q_heat):
     """Hourly electricity (W) of the pellet stove's electronics: running draw while
@@ -556,8 +619,8 @@ if enabled:
               f"{dis / batt_kwh:.0f} /yr" if batt_kwh and pv_tot else "—")
 
     # breakdowns shared by the Sankey and the daily panels
-    standby_w = np.full(8760, float(base_abs))           # always-on floor
-    occ_use_w = (base_w - base_abs) + dhw_w              # extra plugs when there + DHW
+    standby_w = np.full(8760, base_abs + ren_aux_w)      # always-on floor (+ MVHR fans)
+    occ_use_w = base_w - standby_w + dhw_w               # extra plugs when there + DHW
     q_sol_flow = (aw * poa["win_w"] + a_s * poa["win_s"]) * g_win * win_eff
     q_int_w = np.where(occ, q_occ, q_abs)                # people, cooking, appliances
     # heat not carried by electricity (pellet aux power is not heat: it runs fans/auger)
@@ -687,11 +750,177 @@ if enabled:
                "for free out of the outside air; sun and occupants heat the house "
                "in every scenario.")
 
+# ------------------------------------------------------------------ envelope flows
+st.subheader("Envelope — which part of the building gains and loses the heat")
+
+if enabled:
+    GAIN_COLORS = {"heating system": "#eb6834", "sun through windows": "#eda100",
+                   "occupants & appliances": "#d6567d"}
+    gains_now = {"heating system": q_heat_f, "sun through windows": q_sol_flow,
+                 "occupants & appliances": q_int_w}
+    bal = REN.heat_balance(tin_f, w["t2m"], cond, gains_now)
+    loss_tot = sum(bal["losses"].values())
+    ren_on = bool(ren_sel)
+    if ren_on:      # the same scenario in the un-renovated house, for comparison
+        tin_b, q_heat_b, _ = scenario_at(flow_basis, year, AS_BUILT)
+        bal_b = REN.heat_balance(tin_b, w["t2m"], cond_base,
+                                 dict(gains_now, **{"heating system": q_heat_b}))
+        loss_tot_b = sum(bal_b["losses"].values())
+
+    st.caption(f"Heat balance of **{flow_basis}** (the scenario selected above), "
+               f"climate {year}"
+               + (", **after** the selected renovation measures. " if ren_on else ". ")
+               + "The element conductances add up exactly to the "
+               f"{h_tot:.0f} W/K the simulation integrates, and the losses use the "
+               "same hourly indoor temperature — so what comes in equals what goes "
+               "out, element by element.")
+
+    enod, elnk = [], []
+    def enode(label, color):
+        enod.append((label, color))
+        return len(enod) - 1
+    src_id = {k: enode(f"{k} {v:,.0f} kWh", GAIN_COLORS[k])
+              for k, v in bal["gains"].items() if v > 0.5}
+    thru = sum(bal["gains"].values()) + max(-bal["storage"], 0.0)
+    ROOMS = enode(f"heat in the rooms {thru:,.0f} kWh", "#1baf7a")
+    elnk += [(i, ROOMS, bal["gains"][k]) for k, i in src_id.items()]
+    if bal["storage"] < -0.5:      # the structure gave back more than it took up
+        elnk.append((enode(f"released by the structure {-bal['storage']:,.0f} kWh",
+                           "#c3c2b7"), ROOMS, -bal["storage"]))
+    for k, v in bal["losses"].items():
+        elnk.append((ROOMS, enode(f"{k} {v:,.0f} kWh ({v / loss_tot * 100:.0f} %)",
+                                  REN.ELEMENT_COLORS[k]), v))
+    if bal["storage"] > 0.5:
+        elnk.append((ROOMS, enode(f"stored in the structure {bal['storage']:,.0f} kWh",
+                                  "#c3c2b7"), bal["storage"]))
+    elnk = [l for l in elnk if l[2] > 0.5]
+    fig_e = go.Figure(go.Sankey(
+        arrangement="snap",
+        node=dict(label=[n[0] for n in enod], color=[n[1] for n in enod],
+                  pad=20, thickness=16),
+        link=dict(source=[l[0] for l in elnk], target=[l[1] for l in elnk],
+                  value=[round(l[2]) for l in elnk],
+                  color=[rgba(enod[l[0]][1], 0.30) for l in elnk])))
+    fig_e.update_layout(height=400, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig_e, width="stretch")
+    st.caption("Left: everything that heats the rooms — the heating system, the sun "
+               "through the windows and the people, cooking and appliances inside. "
+               "Right: the envelope elements that let it back out, over the whole "
+               "year. Windows appear on both sides: they collect sun during the day "
+               "and lose heat around the clock.")
+
+    el_rows = []
+    def el_row(part, area, spec, w_k, kwh_yr, spec_b=None, kwh_b=None):
+        r = {"part of the building": part, "area m²": area, "spec": spec,
+             "W/K": round(w_k, 1), "share of losses": f"{kwh_yr / loss_tot * 100:.0f} %",
+             "kWh lost/yr": round(kwh_yr)}
+        if ren_on:
+            r["as built (spec)"] = spec_b
+            r["as built kWh/yr"] = round(kwh_b)
+            r["saved kWh/yr"] = round(kwh_b - kwh_yr)
+        el_rows.append(r)
+    for k, (akey, fkey, unit) in REN.ELEMENT_SPEC.items():
+        el_row(k, f"{ren_areas[akey]:.1f}" if akey else "—",
+               f"{fabric[fkey]:.2f} {unit}", cond[k], bal["losses"][k],
+               f"{fabric_base[fkey]:.2f} {unit}", bal_b["losses"][k] if ren_on else 0)
+    el_row("TOTAL", "", f"H = {h_tot:.0f} W/K", h_tot, loss_tot,
+           f"H = {h_base:.0f} W/K", loss_tot_b if ren_on else 0)
+    st.dataframe(pd.DataFrame(el_rows), width="stretch", hide_index=True)
+
+    els = list(bal["losses"])
+    fig_eb = go.Figure()
+    if ren_on:
+        fig_eb.add_trace(go.Bar(y=els, x=[bal_b["losses"][k] for k in els],
+                                name="as built", orientation="h",
+                                marker_color="#c3c2b7"))
+    fig_eb.add_trace(go.Bar(y=els, x=[bal["losses"][k] for k in els],
+                            name="after renovation" if ren_on else "as built",
+                            orientation="h",
+                            marker_color=[REN.ELEMENT_COLORS[k] for k in els]))
+    fig_eb.update_layout(barmode="group", height=330,
+                         margin=dict(l=10, r=10, t=30, b=10),
+                         xaxis_title="heat lost through this element (kWh/yr)",
+                         legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig_eb, width="stretch")
+
+# ------------------------------------------------------------------ renovation economics
+st.subheader("Renovation — cost, savings and payback")
+
+ren_emb_once = REN.embodied_kg_once(ren_items)
+ren_emb_hz = REN.embodied_kg(ren_items, horizon_y)
+
+if not ren_sel:
+    st.info("No measure selected — the house is modelled as built. Pick measures "
+            "under **🔨 Renovation of the envelope** in the sidebar (or start from a "
+            "package) to see them here and in every cost and CO₂ figure on this page.")
+elif enabled:
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("net investment", f"{ren_net:,.0f} CHF",
+              delta=f"{ren_gross:,.0f} CHF − {ren_sub:,.0f} subsidy" if ren_sub
+                    else None, delta_color="off")
+    r2.metric("amortized", f"{ren_capex_yr:,.0f} CHF/yr")
+    r3.metric("heat-loss coefficient", f"{h_base:.0f} → {h_tot:.0f} W/K",
+              delta=f"−{(1 - h_tot / h_base) * 100:.0f} %", delta_color="off")
+    r4.metric("embodied CO₂", f"{ren_emb_once / 1000:.1f} t",
+              delta=f"{ren_emb_hz / 1000:.1f} t over {horizon_y:.0f} y"
+                    if ren_emb_hz > ren_emb_once else None, delta_color="off")
+
+    st.dataframe(pd.DataFrame([
+        {"measure": it["measure"],
+         "quantity": f"{it['quantity']:.1f} m²" if it["unit"] != "lump" else "1 unit",
+         "cost CHF": round(it["chf"]), "subsidy CHF": round(it["subsidy"]),
+         "net CHF": round(it["chf"] - it["subsidy"]), "life y": round(it["life"]),
+         "CHF/yr": round(max(it["chf"] - it["subsidy"], 0) / max(it["life"], 1)),
+         "embodied kg CO₂": round(it["kg"]), "note": it["note"]}
+        for it in ren_items]), width="stretch", hide_index=True)
+
+    def payback(cost, per_year):
+        if per_year <= 0:
+            return "never"
+        return ">200" if cost / per_year > 200 else f"{cost / per_year:.0f}"
+
+    sav_rows = []
+    for name in enabled:
+        _, qh_a = scenario(name)
+        tin_b_s, qh_b, _ = scenario_at(name, year, AS_BUILT)
+        c_a, c_b = running_cost(name, year), running_cost(name, year, AS_BUILT)
+        o_a, o_b = operational_co2(name, year), operational_co2(name, year, AS_BUILT)
+        h_a, h_b = kwh(qh_a), kwh(qh_b)
+        sav_rows.append({
+            "scenario": name,
+            "heat as built kWh": round(h_b), "heat renovated kWh": round(h_a),
+            "heat saved": f"{(1 - h_a / h_b) * 100:.0f} %" if h_b > 1 else "—",
+            "CHF/yr as built": round(c_b), "CHF/yr renovated": round(c_a),
+            "CHF/yr saved": round(c_b - c_a),
+            "payback y": payback(ren_net, c_b - c_a),
+            "kg CO₂/yr saved": round(o_b - o_a),
+            "CO₂ payback y": payback(ren_emb_once, o_b - o_a),
+            "min indoor °C": f"{tin_b_s.min():.1f} → {scenario(name)[0].min():.1f}",
+        })
+    st.dataframe(pd.DataFrame(sav_rows), width="stretch", hide_index=True)
+    st.caption(
+        f"Payback = **{ren_net:,.0f} CHF net** divided by that scenario's yearly "
+        "saving, with no interest, no energy-price escalation and no maintenance "
+        "credit — and the saving is the one this climate horizon produces, so a "
+        "later horizon pays back more slowly as winters get milder. **CO₂ payback** "
+        f"is the {ren_emb_once / 1000:.1f} t embodied in the materials divided by "
+        "the yearly operational saving; on Valais hydro at "
+        f"{co2_elec:.0f} g/kWh there is very little operational CO₂ to save, so "
+        "insulation pays back in money long before it pays back in carbon — switch "
+        "the electricity source in the sidebar to see how that flips. "
+        + ("Off-grid, nothing is bought, so the saving shows up as temperature and "
+           "as unserved kWh rather than as CHF: watch the *min indoor* column."
+           if offgrid else
+           "The *min indoor* column is what the measures do for the house when "
+           "nobody is heating it."))
+
 # ------------------------------------------------------------------ energy & cost table
 st.subheader(f"Energy & yearly cost — climate {year}, {occ_days} days occupied")
 
 rows = []
 def add_row(name, heat, elec, wood, run_cost, capex, tin, pellets=0.0):
+    """`capex` is the system investment; the envelope work is added on top of it."""
+    capex += ren_capex_yr
     rows.append({"scenario": name, "heat delivered kWh": round(heat),
                  "electricity kWh": round(elec), "wood steres": round(wood, 1),
                  "pellets kg": round(pellets),
@@ -700,56 +929,35 @@ def add_row(name, heat, elec, wood, run_cost, capex, tin, pellets=0.0):
                  "min indoor °C": round(float(tin.min()), 1),
                  "h < 0 °C indoor": int((tin < 0).sum())})
 
-grid_p = 0.0 if offgrid else p_elec          # off-grid: nothing is bought from the grid
+hp_cap_yr = hp_capex / hp_life
 need_e = None
 for name in enabled:
     tin, q_heat = scenario(name)
-    if name.startswith("A"):
-        e0 = dhw_e + base_kwh
-        add_row(name, 0, e0, 0, e0 * grid_p, 0, tin)
-    elif name.startswith("B"):
-        e = kwh(q_heat) + dhw_e + base_kwh
-        add_row(name, kwh(q_heat), e, 0, e * grid_p, 0, tin)
-    elif name.startswith("C2"):
-        q_o, q_a = kwh(q_heat[occ]), kwh(q_heat[~occ])
-        steres = q_o / (stove_eff * kwh_stere)
-        add_row(name, q_o + q_a, q_a + dhw_e + base_kwh, steres,
-                steres * p_stere + (q_a + dhw_e + base_kwh) * grid_p, 0, tin)
-    elif name.startswith("C"):
-        steres = kwh(q_heat) / (stove_eff * kwh_stere)
-        add_row(name, kwh(q_heat), dhw_e + base_kwh, steres,
-                steres * p_stere + (dhw_e + base_kwh) * grid_p, 0, tin)
-    elif name.startswith("P"):
-        kg = kwh(q_heat) / (pel_eff * pel_kwh)   # thermostat + timer: covers everything
-        e_aux = kwh(pellet_aux(q_heat))          # fans, auger, igniter
-        add_row(name, kwh(q_heat), e_aux + dhw_e + base_kwh, 0,
-                kg * p_pel + (e_aux + dhw_e + base_kwh) * grid_p,
-                pel_capex / pel_life, tin, pellets=kg)
-    elif name.startswith("E"):
+    key = name.split(" ")[0]
+    e, kg, steres = fuel_and_power(name, year)
+    sys_capex = (pel_capex / pel_life if key == "P" else
+                 hp_cap_yr if key == "E" else 0.0)
+    if key == "E":
         need_e = (tin, q_heat)
+    add_row(name, kwh(q_heat), e, steres, running_cost(name, year), sys_capex,
+            tin, pellets=kg)
 
 if need_e is None and kwp_pv > 0 and not offgrid:   # PV row needs the heat-pump load
     need_e = scenario("E — air-source heat pump")
 
-if need_e is not None:
+if need_e is not None and kwp_pv > 0 and not offgrid:
     tin, need = need_e
     elec_hp_w = hp_electric(need)
-    e_hp = kwh(elec_hp_w) + dhw_e + base_kwh
-    hp_cap_yr = hp_capex / hp_life
-    if "E — air-source heat pump" in enabled:
-        add_row("E — air-source heat pump", kwh(need), e_hp,
-                0, e_hp * grid_p, hp_cap_yr, tin)
-    if kwp_pv > 0 and not offgrid:
-        pv_w_arr = pv_array()
-        load_w = elec_hp_w + dhw_w + base_w
-        imp, exp, selfc, _ = battery_series(pv_w_arr, load_w,
-                                            batt_kwh, batt_kw * 1000, batt_eff)
-        capex = hp_cap_yr + kwp_pv * pv_capex / pv_life + batt_kwh * batt_capex / batt_life
-        add_row(f"E + PV {pv_option} ({kwp_pv:.1f} kWp) + battery",
-                kwh(need), imp, 0, imp * p_elec - exp * p_feed, capex, tin)
-        st.caption(f"PV production {kwh(pv_w_arr):,.0f} kWh/yr "
-                   f"({kwh(pv_w_arr) / 365:.1f} kWh/day avg) — self-consumed "
-                   f"{selfc:,.0f} kWh, exported {exp:,.0f} kWh, imported {imp:,.0f} kWh.")
+    pv_w_arr = pv_array()
+    load_w = elec_hp_w + dhw_w + base_w
+    imp, exp, selfc, _ = battery_series(pv_w_arr, load_w,
+                                        batt_kwh, batt_kw * 1000, batt_eff)
+    capex = hp_cap_yr + kwp_pv * pv_capex / pv_life + batt_kwh * batt_capex / batt_life
+    add_row(f"E + PV {pv_option} ({kwp_pv:.1f} kWp) + battery",
+            kwh(need), imp, 0, imp * p_elec - exp * p_feed, capex, tin)
+    st.caption(f"PV production {kwh(pv_w_arr):,.0f} kWh/yr "
+               f"({kwh(pv_w_arr) / 365:.1f} kWh/day avg) — self-consumed "
+               f"{selfc:,.0f} kWh, exported {exp:,.0f} kWh, imported {imp:,.0f} kWh.")
 
 if rows:
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
@@ -763,11 +971,18 @@ if rows:
                    f"columns, and the unserved kWh in the flow section above.")
     st.caption(f"Every row includes hot water ({dhw_e:.0f} kWh) and plug/standby "
                f"electricity ({base_kwh:.0f} kWh: {base_occ:.0f} W present / "
-               f"{base_abs:.0f} W away). Investment = installed cost / lifetime "
+               f"{base_abs:.0f} W away"
+               + (f", + {ren_aux_w:.0f} W of ventilation fans all year" if ren_aux_w
+                  else "")
+               + "). Investment = installed cost / lifetime "
                "(straight-line, no interest); electric heaters and the existing wood "
                "stove count as zero investment, the pellet stove and heat pump are "
                "amortized. PV changes costs only — indoor temperature follows the "
-               "heat-pump scenario.")
+               "heat-pump scenario."
+               + (f" **Every row also carries the renovation**: "
+                  f"{ren_capex_yr:,.0f} CHF/yr of the {ren_net:,.0f} CHF envelope "
+                  f"work, and its lower heating demand is already in the kWh."
+                  if ren_sel else ""))
 
 # ------------------------------------------------------------------ CO2
 st.subheader(f"CO₂ footprint — yearly use and {horizon_y:.0f}-year total")
@@ -800,15 +1015,18 @@ if enabled:
             comp.update(extra)
         return label, comp, sum(parts_now.values())
 
+    # the envelope work is done once and emits once, whatever heats the house
+    ren_extra = {"renovation materials": ren_emb_hz} if ren_items else {}
+
     specs = []
     for name in enabled:
         key = name.split(" ")[0]
-        items, extra = [], None
+        items, extra = [], dict(ren_extra)
         if key == "P":
             items.append(("pellet stove manufacture", pelstove_kg, pel_life))
         if key == "E":
             items.append(("heat pump manufacture", hp_kg, hp_life))
-            extra = {"refrigerant leakage": hp_refrig}
+            extra["refrigerant leakage"] = hp_refrig
         if offgrid and kwp_pv > 0:      # off-grid: PV+battery power the whole house
             items += pv_items
         specs.append(build(name, operational_parts(name, year),
@@ -822,7 +1040,7 @@ if enabled:
             dict(zero, **{"grid electricity":
                           pv_grid_import(year + horizon_y) * co2_elec / 1000}),
             [("heat pump manufacture", hp_kg, hp_life)] + pv_items,
-            {"refrigerant leakage": hp_refrig}))
+            dict(ren_extra, **{"refrigerant leakage": hp_refrig})))
 
     SRC_COLORS = {"grid electricity": "#8a63d2",
                   "pellets (supply chain)": "#b08d63",
@@ -832,7 +1050,8 @@ if enabled:
                   "battery manufacture": "#1baf7a",
                   "heat pump manufacture": "#2a78d6",
                   "refrigerant leakage": "#d6567d",
-                  "pellet stove manufacture": "#898781"}
+                  "pellet stove manufacture": "#898781",
+                  "renovation materials": "#c3c2b7"}
     used = [s for s in SRC_COLORS if any(sp[1].get(s, 0) > 0.5 for sp in specs)]
 
     co2_rows = []
@@ -869,7 +1088,11 @@ if enabled:
         + f"), heat pump every {hp_life:.0f} y (+ refrigerant GWP {refrig_gwp:.0f} "
         f"leaking {refrig_leak:.1f} %/yr), pellet stove every {pel_life:.0f} y. "
         "Use-phase emissions are averaged between today's and the "
-        f"{year + horizon_y:.0f} climate, so the declining heating demand is included.")
+        f"{year + horizon_y:.0f} climate, so the declining heating demand is included."
+        + (f" **Renovation materials** ({ren_emb_hz / 1000:.1f} t) appear in every "
+           "row — the envelope is insulated once whatever heats the house — and the "
+           "heating demand they remove is already reflected in the use-phase bar."
+           if ren_items else ""))
 
 # ------------------------------------------------------------------ assumptions echo
 with st.expander("📋 All assumptions & derived values (current)"):

@@ -159,6 +159,57 @@ R290 at GWP 3, ~1 t over 50 y if it were R32 at GWP 675), pellet stove 15 y.
 ~70 cycles/yr through it against a 6 000-cycle rating (85 years' worth), so it dies
 of old age at ~15 years — sizing it bigger buys nothing in carbon terms.
 
+## Where the heat actually goes — and what renovating changes
+
+The 115 W/K is not one number, it is five. `renovation.py` splits it into the parts
+of the building that lose the heat, and the split is *exact*: the element
+conductances sum to the H the RC model integrates, so an annual heat balance built
+from them closes to ~0.1 % (the residual is the heat left stored in the structure).
+
+| part | area | U (as built) | W/K | share |
+|---|---|---|---|---|
+| walls | 103.7 m2 | 0.33 | 34.4 | **30 %** |
+| floor → cellar | 60.0 m2 | 0.80 | 28.8 | **25 %** |
+| ventilation & air leaks | — | 0.45 /h | 26.8 | **23 %** |
+| windows | 5.2 m2 | 2.80 | 14.6 | 13 % |
+| roof | 65.8 m2 | 0.16 | 10.3 | 9 % |
+
+The uninsulated floor over the cellar loses a quarter of the heat through 60 m2 that
+can be reached from below without touching the living space — it is the cheapest
+fix in the house. The roof, already carrying 20 cm, is the one with least left to win.
+
+A **measure** does only four things: it lowers one U-value or the air change rate, it
+costs money, it embodies CO₂, and it may add a small permanent electric load (MVHR
+fans). Nothing in the catalogue knows about heating systems or prices — the dashboard
+hands the modified fabric back to the *same* simulation, so heating demand, running
+cost and CO₂ all follow by themselves. Alternatives on one element (inside vs outside
+insulation, triple vs double glazing) are resolved to the better one and only it is
+billed.
+
+| package | H | net cost (after subsidy) | embodied |
+|---|---|---|---|
+| as built | 115 W/K | — | — |
+| quick wins (floor + air sealing) | 84 W/K | 9 100 CHF | 1.0 t |
+| envelope without touching the facade | 57 W/K | 36 100 CHF | 3.5 t |
+| deep retrofit (everything) | 43 W/K | 73 600 CHF | 6.8 t |
+
+Costs are installed Valais 2025-26 prices for a small, hard-to-access building, net of
+the *Programme Bâtiments* M-01 flat rate (~70 CHF/m2 on opaque elements; windows
+alone, sealing and ventilation do not qualify). All editable in the dashboard.
+
+**The honest result: on this house the payback is long.** A deep retrofit cuts the
+heating demand ~68 %, but a chalet occupied ~74 days a year with a 7 °C frost guard
+only spends ~500-1 000 CHF/yr on heat in the first place, so 73 600 CHF pays back over
+a century, and mild future winters stretch that further. The quick wins are a
+different story — 9 100 CHF against a third of the losses. And on Valais hydro at
+12 g/kWh there is almost no operational CO₂ to save, so insulation pays back in money
+long before it pays back in carbon; switch the electricity source to the European
+winter marginal (400 g/kWh) and that flips.
+
+Renovation also matters where no energy is bought at all: free-floating, the deep
+retrofit lifts the coldest indoor hour from −15 °C to −8 °C, and off-grid it is worth
+more than more battery, because heat you never lose needs no power.
+
 ## Natural hazards
 
 The slope above Zinal is largely covered by cantonal avalanche danger zones (blue,
@@ -190,6 +241,16 @@ streamlit run app.py
   ACH, thermal mass, window areas, system capacities, COP curve, pellet stove,
   PV modules & PR, battery, prices, investment costs & lifetimes) and echoed in a
   summary table; investment is amortized straight-line over the lifetime
+- **envelope flows**: a second Sankey — heating system, sun through the windows and
+  occupants on the left, the rooms in the middle, and on the right the walls, roof,
+  windows, floor and air changes that let it back out, with each element's share of
+  the year's losses; plus a per-element table and an as-built vs renovated bar chart
+- **renovation measures** (sidebar, or start from a package): floor, air sealing,
+  windows, roof, walls inside/outside, MVHR. Each one only moves a U-value or the ACH,
+  so the whole page — indoor temperature, heating demand, costs, CO₂ — updates from
+  the same simulation. A dedicated section gives net cost after the Programme
+  Bâtiments subsidy, embodied CO₂, and per-scenario savings with money and carbon
+  payback; the amortized envelope cost also lands in every row of the cost table
 - **CO₂ section**: yearly emissions and the 50-year total, broken down by source —
   grid electricity, pellet/firewood supply chain, unregrown biogenic carbon, and the
   manufacture of PV, battery, heat pump, pellet stove plus refrigerant leakage, with
@@ -213,6 +274,9 @@ streamlit run app.py
   with the sources and the biogenic-carbon caveat documented inline
 - `model.py` — constants, weather loaders (incl. TMY bias correction), solar geometry +
   horizon masking, day/night warming trends, 1-node RC model
+- `renovation.py` — the envelope split (element areas → conductances → exact heat
+  balance) and the renovation measure catalogue with costs, embodied CO₂, lifetimes
+  and subsidies; `python renovation.py` prints the loss breakdown per package
 - `simulate.py` — occupancy calendar (~74 d/yr) + scenarios × 6 climate horizons;
   writes `out/scenarios.csv`, `out/daynight.csv`, `out/pv_roof.csv`
 - `make_plots.py` — sun-path, monthly energy, cost, free-float, day/night, roof-PV figures
