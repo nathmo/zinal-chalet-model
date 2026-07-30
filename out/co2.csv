@@ -1,0 +1,10 @@
+scenario,kg_per_year_now,t_use_50y,t_equipment_50y,t_total_50y
+A do nothing,11,0.54,0.0,0.54
+B electric,85,3.77,0.0,3.77
+C wood only,91,4.21,0.0,4.21
+C2 wood+frost,107,4.78,0.0,4.78
+P pellet stove,266,11.63,1.6,13.23
+D +solar thermal,83,3.68,0.0,3.68
+E heat pump,44,1.99,4.51,6.49
+F PV half roof,28,1.24,15.83,17.07
+F2 PV full roof,24,1.07,24.76,25.83
