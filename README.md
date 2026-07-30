@@ -4,6 +4,8 @@ Hourly thermal model of a **timber chalet in Zinal (Val d'Anniviers, Valais,
 Switzerland)** — real terrain, mountain-horizon shading, and climate data for the
 valley, at village resolution.
 
+Explore it on streamlit : https://chalet-energy-model.streamlit.app/
+
 > **Location resolution.** The site is a 1 km grid point (46.13 N, 7.63 E, ~1680 m)
 > on the east flank of the valley — deliberately not a specific address. The
 > building below is a *typical* 1960s-70s Anniviers chalet; treat the dimensions and
